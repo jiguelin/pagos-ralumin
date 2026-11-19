@@ -94,6 +94,22 @@ class RetencionInfo:
 
 
 @dataclass
+class Coincidencia:
+    """Pista para un egreso sin sustento: documentos pendientes de un mismo proveedor cuyo saldo suma el pago.
+    Nunca se aplica sola: el equipo la confirma en "Resolver pagos dudosos"."""
+    ruc: str
+    nombre: str
+    lineas: list[tuple[str, float]]      # (número de documento, monto en la moneda de la cuenta bancaria)
+    forma: str                           # 'exacto' / 'con retención 3%' / 'aproximado por TC'
+
+    @property
+    def texto(self) -> str:
+        docs = ', '.join(n for n, _ in self.lineas)
+        extra = {'con retención 3%': ' — si se retuvo el 3%', 'aproximado por TC': ' — en otra moneda, monto aproximado'}
+        return f'{self.nombre} ({self.ruc}): {docs}' + extra.get(self.forma, '')
+
+
+@dataclass
 class Propuesta:
     mov: Movimiento
     estado: str
@@ -111,6 +127,7 @@ class Propuesta:
     medio: str = ''
     glosa: str = ''
     notas: list[str] = field(default_factory=list)
+    coincidencias: list['Coincidencia'] = field(default_factory=list)   # sin sustento: pistas por monto
 
     @property
     def importe(self) -> float:
@@ -234,11 +251,6 @@ def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplica
             out.append(p)
             continue
         p.cuenta, p.moneda = cb
-        if it.tipo == 'sin sustento' and not (sol or pat):
-            p.estado = 'revisar'
-            p.motivos.append(it.motivo)
-            out.append(p)
-            continue
         if it.tipo == 'adelanto' and not sol:
             p.estado = 'adelanto'
             p.motivos.append('Adelanto de importación: se registra aparte')
@@ -253,6 +265,14 @@ def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplica
         p.tc, p.tc_fecha = t.venta, t.fecha
         if not exacto:
             p.notas.append(f'TC del {t.fecha:%d/%m} (sin publicación el {m.fecha:%d/%m})')
+        if it.tipo == 'sin sustento' and not (sol or pat):
+            p.estado = 'revisar'
+            p.motivos.append(it.motivo)
+            p.coincidencias = coincidencias_por_monto(p, idx)
+            if p.coincidencias:
+                p.motivos.append('Coincide por monto con: ' + ' | '.join(c.texto for c in p.coincidencias[:3]))
+            out.append(p)
+            continue
         bcos = bancos or cfg.RUC_BANCO
         if sol:
             _cruzar(p, _interp_de(it, sol['nombre'], sol['lineas'], sol.get('comision', 0.0), p.moneda), idx, bcos,
@@ -442,3 +462,40 @@ def _de_moneda_doc(monto_doc: float, p: Propuesta, d: Documento) -> float:
     if (d.moneda == 'D') == (p.moneda == 'D'):
         return monto_doc
     return round(monto_doc * p.tc, 2) if d.moneda == 'D' else round(monto_doc / p.tc, 2)
+
+
+def coincidencias_por_monto(p: Propuesta, idx: Indice4212, max_docs: int = 3, max_resultados: int = 5) -> list[Coincidencia]:
+    """Pistas para un egreso sin sustento, en este orden:
+    1) documentos de un mismo proveedor, en la moneda de la cuenta, cuyo saldo suma exactamente el pago (hasta 3);
+    2) lo mismo, pagando 97 % (factura con retención del 3 %);
+    3) un solo documento en la otra moneda cuyo saldo × TC SUNAT se acerca al pago (±1 %: el banco usa su propio TC).
+    No se consideran documentos emitidos después del pago."""
+    from itertools import combinations
+    if not p.tc or not p.moneda:
+        return []
+    meta, fecha = p.importe, p.mov.fecha
+    out: list[Coincidencia] = []
+    for ruc, ds in idx.por_ruc.items():
+        misma, otra = [], []
+        for d in ds:
+            disp = idx.disponible(d)
+            if disp <= 0.05 or (fecha and d.fecha_doc and d.fecha_doc > fecha):
+                continue
+            ((misma if (d.moneda == 'D') == (p.moneda == 'D') else otra)).append((d, disp))
+        misma = sorted(misma, key=lambda x: (x[0].fecha_doc is None, x[0].fecha_doc))[-25:]
+        for n in range(1, max_docs + 1):
+            for combo in combinations(misma, n):
+                total = round(sum(x for _, x in combo), 2)
+                if abs(total - meta) <= 0.01:
+                    out.append(Coincidencia(ruc, idx.nombres[ruc], [(d.numero, x) for d, x in combo], 'exacto'))
+                elif all(d.tipo == '01' for d, _ in combo) and abs(round(total * 0.97, 2) - meta) <= 0.02 * n:
+                    lineas = [(d.numero, round(x * 0.97, 2)) for d, x in combo]
+                    ajuste = round(meta - sum(x for _, x in lineas), 2)       # el último documento absorbe el redondeo
+                    lineas[-1] = (lineas[-1][0], round(lineas[-1][1] + ajuste, 2))
+                    out.append(Coincidencia(ruc, idx.nombres[ruc], lineas, 'con retención 3%'))
+        for d, disp in otra:
+            if abs(_de_moneda_doc(disp, p, d) - meta) <= meta * 0.01:
+                out.append(Coincidencia(ruc, idx.nombres[ruc], [(d.numero, meta)], 'aproximado por TC'))
+    orden = {'exacto': 0, 'con retención 3%': 1, 'aproximado por TC': 2}
+    out.sort(key=lambda c: (orden[c.forma], len(c.lineas)))
+    return out[:max_resultados]

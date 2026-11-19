@@ -359,14 +359,19 @@ def resolver_dudosos(ps, docs, est):
     if sug:
         (st.info if sug.ruc else st.warning)(f"IA ({sug.confianza}%): {sug.razon}" + ('  \n' + '  \n'.join(sug.avisos) if sug.avisos else ''))
     texto = (p.interp.proveedor_texto if p.interp else '') or p.mov.sustento
-    ranking = [r for r, _ in sorted(idx.nombres.items(), key=lambda kv: -parecido(texto, kv[1]))]
-    preferido = (sug.ruc if sug and sug.ruc else '') or (p.ruc if p.ruc in idx.nombres else '') or (ranking[0] if ranking else '')
+    coin = {c.ruc: c for c in reversed(p.coincidencias)}          # la mejor coincidencia de cada proveedor
+    if p.coincidencias:
+        st.info('🔎 **Sin sustento, pero el monto coincide con:**  \n' + '  \n'.join(
+            f'• {c.texto}' for c in p.coincidencias) + '  \nConfirme con el comprobante o el voucher antes de guardar.')
+    ranking = [r for r, _ in sorted(idx.nombres.items(), key=lambda kv: (kv[0] not in coin, -parecido(texto, kv[1])))]
+    preferido = ((sug.ruc if sug and sug.ruc else '') or (p.coincidencias[0].ruc if p.coincidencias else '')
+                 or (p.ruc if p.ruc in idx.nombres else '') or (ranking[0] if ranking else ''))
     if not ranking:
         st.warning('No hay documentos pendientes cargados.')
         return
     ruc = st.selectbox('Proveedor', ranking, index=ranking.index(preferido) if preferido in ranking else 0,
                        format_func=lambda r: f'{idx.nombres[r]} ({r})', key=f'prov_{pid}')
-    sug_l = {n: m for n, m in (sug.lineas if sug and sug.ruc == ruc else [])}
+    sug_l = {n: m for n, m in (sug.lineas if sug and sug.ruc == ruc else (coin[ruc].lineas if ruc in coin else []))}
     ds = sorted([d for d in idx.por_ruc.get(ruc, []) if idx.disponible(d) > 0.05], key=lambda d: (d.fecha_doc is None, d.fecha_doc))
     neto = round(p.importe - (p.interp.comision if p.interp else 0), 2)
     filas = []
@@ -388,10 +393,14 @@ def resolver_dudosos(ps, docs, est):
     elegidas = [[r['Documento'], round(float(r[col_pago] or 0), 2)] for r in ed.to_dict('records') if r['Incluir'] and r[col_pago]]
     dif = round(p.importe - sum(x for _, x in elegidas) - com, 2)
     c2.metric('Diferencia con el banco', f'{dif:,.2f}')
-    recordar = st.checkbox('Recordar este proveedor para este texto del sustento', value=True, key=f'rec_{pid}')
-    modo = st.radio('En los próximos meses, para pagos con el mismo texto (sin importar números ni meses):',
-                    ['No', 'Elegir el documento con saldo igual al pago', 'Elegir los documentos más antiguos'],
-                    horizontal=True, key=f'modo_{pid}')
+    if not p.mov.sustento.strip():
+        recordar, modo = False, 'No'           # sin sustento no hay texto que aprender: solo se resuelve este pago
+        st.caption('Como no hay sustento, se guarda solo para este pago (no se aprende un patrón).')
+    else:
+        recordar = st.checkbox('Recordar este proveedor para este texto del sustento', value=True, key=f'rec_{pid}')
+        modo = st.radio('En los próximos meses, para pagos con el mismo texto (sin importar números ni meses):',
+                        ['No', 'Elegir el documento con saldo igual al pago', 'Elegir los documentos más antiguos'],
+                        horizontal=True, key=f'modo_{pid}')
     if st.button('Guardar solución', type='primary', disabled=(abs(dif) > 0.01 or not elegidas), key=f'guardar_{pid}'):
         MEM.aprender(mov_id=p.mov.id, firma=L.firma_mov(p.mov), sustento=p.mov.sustento,
                      proveedor_texto=texto if p.interp and p.interp.proveedor_texto else '', ruc=ruc, nombre=idx.nombres[ruc],

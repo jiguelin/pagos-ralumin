@@ -118,3 +118,24 @@ def test_lotes_bloquean_y_descuentan(tmp_path):
     est = L.estado(L.listar(alm), 'pagos', '2026-01-01')
     assert L.listar(alm)[0]['items'][0]['asiento'] == '04-2'
     assert proponer(movs, docs, H, registrados_app=est['registrados'])[0].estado == 'registrado'
+
+
+def test_sin_sustento_busca_por_monto():
+    from datetime import date
+    from motor.banco import Movimiento
+    from motor.cruce import proponer
+    from motor.cxp import Documento
+    from motor.tipo_cambio import HistorialTC, TC
+    h = HistorialTC([TC(date(2026, 9, 10), 3.50, 3.52)])
+    docs = [Documento('20111111111', 'ACME SAC', '01', 'F001-00000010', date(2026, 8, 1), None, 'S', 0, -1000.0, '4212'),
+            Documento('20111111111', 'ACME SAC', '01', 'F001-00000011', date(2026, 8, 5), None, 'S', 0, -500.0, '4212'),
+            Documento('20222222222', 'OTRA SAC', '01', 'F002-00000001', date(2026, 8, 5), None, 'S', 0, -777.0, '4212')]
+    m = Movimiento(pestana='BBVA-SEPT-26', banco='BBVA', fila=9, col_asiento=6, fecha=date(2026, 9, 10),
+                   detalle='P.P.: 0011', operacion='1', monto=-1500.0, moneda_texto='S/', asiento='',
+                   nro_cuenta='011-616-000200310321-01', letra='B', sustento='')
+    p = proponer([m], docs, h)[0]
+    assert p.estado == 'revisar' and p.tc
+    assert p.coincidencias and p.coincidencias[0].ruc == '20111111111' and len(p.coincidencias[0].lineas) == 2
+    m.monto = -970.0                                     # 1,000 menos 3 % de retención
+    p = proponer([m], docs, h)[0]
+    assert any(c.forma == 'con retención 3%' and c.lineas == [('F001-00000010', 970.0)] for c in p.coincidencias)
