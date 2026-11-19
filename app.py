@@ -421,14 +421,29 @@ with t_pagos:
         if not tabs:
             st.error('No se encontraron pestañas de bancos (por ejemplo "BCP-OCT-26").')
             st.stop()
-        _, a0, m0 = info_pestana(tabs[0])
-        por_defecto = [t for t in tabs if info_pestana(t)[1:] == (a0, m0)]
-        elegidas = st.multiselect('Pestañas del Sheet', tabs, default=por_defecto)
-        movs = [m for t in elegidas for m in leer_pestana(t, libro[t])]
+        meses_ws = sorted({info_pestana(t)[1:] for t in tabs}, reverse=True)
+        c1, c2 = st.columns([1, 2])
+        mes_sel = c1.selectbox('Mes de trabajo', meses_ws, format_func=lambda am: nombre_mes(f'{am[0]}-{am[1]:02d}'), key='mes_trabajo')
+        del_mes = [t for t in tabs if info_pestana(t)[1:] == mes_sel]
+        elegidas = c2.multiselect('Bancos (pestañas del Sheet)', del_mes, default=del_mes, key=f'pest_{mes_sel}')
         est = L.estado(lotes, 'pagos', fecha_cxp)
-        ps = proponer(movs, docs, historial_tc(), aplicado=est['aplicado'], registrados_app=est['registrados'],
-                      en_lote=est['en_lote'], memoria=MEM)
+        h_tc = historial_tc()
+        avance, ps = [], []
+        for t in del_mes:
+            ps_t = proponer(leer_pestana(t, libro[t]), docs, h_tc, aplicado=est['aplicado'], registrados_app=est['registrados'],
+                            en_lote=est['en_lote'], memoria=MEM)
+            c = pd.Series([p.estado for p in ps_t]).value_counts() if ps_t else pd.Series(dtype=int)
+            pend = int(c.get('listo', 0) + c.get('revisar', 0) + c.get('adelanto', 0))
+            avance.append({'Pestaña': t.strip(), 'Egresos': len(ps_t), '✅ Registrados': int(c.get('registrado', 0)),
+                           '📦 En lote': int(c.get('en lote', 0)), '🟢 Listos': int(c.get('listo', 0)),
+                           '🟡 Revisar': int(c.get('revisar', 0)), '🔵 Adelantos': int(c.get('adelanto', 0)),
+                           '⚪ Fuera': int(c.get('fuera', 0)),
+                           'Estado': 'Sin movimientos' if not ps_t else ('Terminada' if pend == 0 and not c.get('en lote', 0) else 'En proceso')})
+            if t in elegidas:
+                ps += ps_t
+        st.dataframe(pd.DataFrame(avance), hide_index=True, width='stretch')
         cont = pd.Series([p.estado for p in ps]).value_counts() if ps else pd.Series(dtype=int)
+        st.caption('Totales de los bancos elegidos:')
         cols = st.columns(6)
         for c, k in zip(cols, ['listo', 'revisar', 'adelanto', 'en lote', 'registrado', 'fuera']):
             c.metric(ESTADOS[k], int(cont.get(k, 0)))
