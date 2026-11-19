@@ -173,11 +173,13 @@ def resumen_tc() -> pd.DataFrame:
 
 
 def meses_faltantes(meses: list[str]) -> list[str]:
-    """Huecos entre el primer y el último mes cargado."""
+    """Huecos en los últimos 12 meses hasta el más reciente cargado (un mes suelto antiguo no genera avisos)."""
     if not meses:
         return []
-    a0, m0 = map(int, min(meses).split('-'))
     a1, m1 = map(int, max(meses).split('-'))
+    a_ini, m_ini = (a1 - 1, m1 + 1) if m1 < 12 else (a1, 1)
+    recientes = [x for x in meses if x >= f'{a_ini}-{m_ini:02d}']
+    a0, m0 = map(int, min(recientes).split('-'))
     falt, a, m = [], a0, m0
     while (a, m) <= (a1, m1):
         ym = f'{a}-{m:02d}'
@@ -255,9 +257,12 @@ with st.sidebar:
             for f in pdfs:
                 try:
                     tcs = leer_pdf_sunat(f.getvalue())
+                    antes = set(historial_tc().meses_cargados())
                     guardar_tc(tcs, f.name)
                     meses = sorted({t.fecha.strftime('%Y-%m') for t in tcs})
-                    avisos.append(('ok', f'{f.name} → {", ".join(nombre_mes(m) for m in meses)} ({len(tcs)} días)'))
+                    ya = [m for m in meses if m in antes]
+                    nota = ' — ya estaba cargado: se actualizó (sin duplicar)' if ya else ''
+                    avisos.append(('ok', f'{f.name} → {", ".join(nombre_mes(m) for m in meses)} ({len(tcs)} días){nota}'))
                 except Exception as ex:
                     avisos.append(('error', f'{f.name}: no se pudo leer ({ex})'))
             st.session_state['avisos_carga'] = avisos
