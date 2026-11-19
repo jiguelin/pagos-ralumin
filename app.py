@@ -138,11 +138,59 @@ def historial_tc() -> HistorialTC:
     return HistorialTC([TC(date.fromisoformat(f), c, v, 'SUNAT PDF') for f, c, v in filas])
 
 
-def guardar_tc(nuevos: list[TC]):
+MESES_ES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+
+
+def nombre_mes(ym: str) -> str:
+    a, m = ym.split('-')
+    return f'{MESES_ES[int(m) - 1]} {a}'
+
+
+def guardar_tc(nuevos: list[TC], archivo: str = ''):
     d = {f: (c, v) for f, c, v in (ALM.leer('tc', defecto=[]) or [])}
     for t in nuevos:
         d[t.fecha.isoformat()] = (t.compra, t.venta)
     ALM.guardar('tc', [[f, c, v] for f, (c, v) in sorted(d.items())])
+    meta = ALM.leer('tc_meses', defecto={}) or {}
+    for ym in sorted({t.fecha.strftime('%Y-%m') for t in nuevos}):
+        meta[ym] = dict(archivo=archivo, cargado=datetime.now().isoformat(timespec='seconds'))
+    ALM.guardar('tc_meses', meta)
+
+
+def resumen_tc() -> pd.DataFrame:
+    filas = ALM.leer('tc', defecto=[]) or []
+    meta = ALM.leer('tc_meses', defecto={}) or {}
+    por_mes: dict[str, list] = {}
+    for f, c, v in filas:
+        por_mes.setdefault(f[:7], []).append((f, v))
+    out = []
+    for ym in sorted(por_mes, reverse=True):
+        dias = sorted(por_mes[ym])
+        out.append({'Mes': nombre_mes(ym), 'Días': len(dias), 'Del': dias[0][0][8:10] + '/' + ym[5:], 'Al': dias[-1][0][8:10] + '/' + ym[5:],
+                    'Venta último día': dias[-1][1], 'Archivo': meta.get(ym, {}).get('archivo', ''),
+                    'Cargado': meta.get(ym, {}).get('cargado', '')[:16].replace('T', ' ')})
+    return pd.DataFrame(out)
+
+
+def meses_faltantes(meses: list[str]) -> list[str]:
+    """Huecos entre el primer y el último mes cargado."""
+    if not meses:
+        return []
+    a0, m0 = map(int, min(meses).split('-'))
+    a1, m1 = map(int, max(meses).split('-'))
+    falt, a, m = [], a0, m0
+    while (a, m) <= (a1, m1):
+        ym = f'{a}-{m:02d}'
+        if ym not in meses:
+            falt.append(nombre_mes(ym))
+        a, m = (a + 1, 1) if m == 12 else (a, m + 1)
+    return falt
+
+
+def avisos_de_carga():
+    """Resultados de la última carga: se muestran después de recargar la página."""
+    for tipo, texto in st.session_state.pop('avisos_carga', []):
+        (st.success if tipo == 'ok' else st.error)(texto)
 
 
 def cuentas_banco() -> tuple[dict, dict]:
@@ -166,6 +214,7 @@ aplicar_config_cuentas()
 # ----------------------------------------------------------------------------- barra lateral: archivos
 with st.sidebar:
     st.header('Archivos')
+    avisos_de_carga()
     docs, resumen_cxp, fecha_cxp = documentos_pendientes()
     if resumen_cxp:
         for r in resumen_cxp:
@@ -176,29 +225,43 @@ with st.sidebar:
         st.caption('Reporte "Análisis de documentos pendientes" en moneda original. Reemplaza la versión anterior de esa cuenta.')
         subidos = st.file_uploader('Excel de NewContaSis', type=['xlsx'], accept_multiple_files=True, key='up_cxp')
         if subidos and st.button('Guardar cuentas por pagar', type='primary'):
+            avisos = []
             for f in subidos:
                 data = f.getvalue()
                 try:
                     d, info = leer_pendientes(data)
                 except Exception as ex:
-                    st.error(f'{f.name}: no se pudo leer ({ex})')
+                    avisos.append(('error', f'{f.name}: no se pudo leer ({ex})'))
                     continue
                 cuenta = info.get('cuenta') or '4212'
                 guardar_archivo(f'archivo:pendientes:{cuenta}', f.name, data, info)
-                st.success(f'{f.name}: cuenta {cuenta}, {len(d)} documentos pendientes.')
+                avisos.append(('ok', f'{f.name} → cuenta {cuenta}, al mes de {info.get("mes") or "?"}: {len(d)} documentos pendientes'))
+            st.session_state['avisos_carga'] = avisos
             st.rerun()
 
     h = historial_tc()
-    st.caption('Tipo de cambio SUNAT: ' + (', '.join(h.meses_cargados()) if len(h) else '—'))
-    with st.expander('Subir tipo de cambio SUNAT (PDF del mes)'):
-        pdfs = st.file_uploader('PDF de SUNAT', type=['pdf'], accept_multiple_files=True, key='up_tc')
-        if pdfs and st.button('Guardar tipo de cambio'):
+    meses_tc = h.meses_cargados()
+    st.caption('Tipo de cambio SUNAT: ' + (f'{len(meses_tc)} meses, de {nombre_mes(meses_tc[0])} a {nombre_mes(meses_tc[-1])}' if meses_tc else '—'))
+    falt = meses_faltantes(meses_tc)
+    if falt:
+        st.warning('Faltan meses de tipo de cambio: ' + ', '.join(falt))
+    with st.expander('Tipo de cambio SUNAT (PDF del mes)'):
+        if meses_tc:
+            st.dataframe(resumen_tc()[['Mes', 'Días', 'Del', 'Al', 'Archivo', 'Cargado']], hide_index=True, width='stretch')
+        n_up = st.session_state.get('n_up_tc', 0)
+        pdfs = st.file_uploader('Agregar PDF de SUNAT (uno o varios meses)', type=['pdf'], accept_multiple_files=True, key=f'up_tc_{n_up}')
+        if pdfs and st.button(f'Guardar {len(pdfs)} PDF', type='primary'):
+            avisos = []
             for f in pdfs:
                 try:
-                    guardar_tc(leer_pdf_sunat(f.getvalue()))
-                    st.success(f'{f.name}: leído.')
+                    tcs = leer_pdf_sunat(f.getvalue())
+                    guardar_tc(tcs, f.name)
+                    meses = sorted({t.fecha.strftime('%Y-%m') for t in tcs})
+                    avisos.append(('ok', f'{f.name} → {", ".join(nombre_mes(m) for m in meses)} ({len(tcs)} días)'))
                 except Exception as ex:
-                    st.error(f'{f.name}: {ex}')
+                    avisos.append(('error', f'{f.name}: no se pudo leer ({ex})'))
+            st.session_state['avisos_carga'] = avisos
+            st.session_state['n_up_tc'] = n_up + 1          # vacía el cuadro de subida
             st.rerun()
 
     ent_data, ent_meta = leer_archivo('archivo:entidades')
@@ -422,15 +485,19 @@ with t_ret:
                '4212 al Debe, 401141 al Haber (sin 104). En dólares: soles ÷ TC venta SUNAT de la fecha del comprobante.')
     up = st.file_uploader('Retenciones del mes (.xls / .xlsx)', type=['xls', 'xlsx'], accept_multiple_files=True, key='up_ret')
     if up and st.button('Guardar retenciones'):
+        avisos = []
         for f in up:
             crs, av = leer_excel_retenciones(f.getvalue(), f.name)
             if not crs:
-                st.error(f'{f.name}: no se encontraron comprobantes.')
+                avisos.append(('error', f'{f.name}: no se encontraron comprobantes de retención.'))
                 continue
             mes = max(c.fecha for c in crs)[:7]
             guardar_archivo(f'archivo:retenciones:{mes}', f.name, f.getvalue(), {'comprobantes': len(crs)})
-            st.success(f'{f.name}: {len(crs)} comprobantes ({mes}).')
+            avisos.append(('ok', f'{f.name} → {nombre_mes(mes)}: {len(crs)} comprobantes'))
+        st.session_state['avisos_ret'] = avisos
         st.rerun()
+    for tipo, texto in st.session_state.pop('avisos_ret', []):
+        (st.success if tipo == 'ok' else st.error)(texto)
     claves_ret = ALM.claves('archivo:retenciones:')
     if not claves_ret:
         st.info('Suba el Excel de retenciones del mes.')
@@ -438,7 +505,7 @@ with t_ret:
         st.info('Suba la 4212.')
     else:
         meses = [k.split(':')[-1] for k in claves_ret]
-        mes = st.selectbox('Mes', sorted(meses, reverse=True))
+        mes = st.selectbox('Mes', sorted(meses, reverse=True), format_func=nombre_mes)
         data, meta = leer_archivo(f'archivo:retenciones:{mes}')
         crs, _ = _leer_ret_cache(_h(data), data, meta['nombre'])
         est_r = L.estado(lotes, 'retenciones', fecha_cxp)
