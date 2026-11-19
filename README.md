@@ -19,9 +19,10 @@ Google Sheet (pestaña banco-mes) ─▶ egresos sin asiento en la columna de co
    se actualice; el PDF de **tipo de cambio SUNAT** del mes; cuando cambien, el **plan de cuentas** y las **entidades**.
    El app guarda la última versión de cada uno.
 2. **Leer el Sheet ahora** (o subirlo como Excel).
-3. **💸 Pagos:** elegir el **mes de trabajo** y los bancos (BCP, BBVA, Scotiabank). La tabla de **avance por pestaña** muestra
-   qué falta en cada banco (registrados, en lote, listos, por revisar, fuera de alcance). Filtrar por días, cuenta o proveedor,
-   desmarcar lo que no va y **Crear lote**. El banco, mes y año salen del nombre de la pestaña ("BCP-SEPT -26", "SCOTIA-AGOS-26").
+3. **💸 Pagos:** elegir el **mes de trabajo** y **una pestaña a la vez** (la app sugiere la primera con pendientes; el
+   desplegable "Avance de las pestañas del mes" muestra qué falta en cada banco). Solo egresos (montos en negativo).
+   Por defecto entran todos los pagos listos de la pestaña; para ir por bloques, filtrar por días, cuenta o proveedor, o
+   desmarcar pagos, y **Crear lote**. El banco, mes y año salen del nombre de la pestaña ("BCP-SEPT -26", "SCOTIA-AGOS-26").
 4. **📦 Lotes:** descargar el Excel, importarlo en NewContaSis (Sub Diario 04 · L/Registro 01 · F/Efectivo F055) y anotar
    el **Asiento Inicio**: el app asigna el 04-N de cada pago y lo escribe en la columna de control del Sheet.
    Si la importación falla: **Anular lote** y los pagos vuelven a estar disponibles.

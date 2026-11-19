@@ -425,33 +425,40 @@ with t_pagos:
         c1, c2 = st.columns([1, 2])
         mes_sel = c1.selectbox('Mes de trabajo', meses_ws, format_func=lambda am: nombre_mes(f'{am[0]}-{am[1]:02d}'), key='mes_trabajo')
         del_mes = [t for t in tabs if info_pestana(t)[1:] == mes_sel]
-        elegidas = c2.multiselect('Bancos (pestañas del Sheet)', del_mes, default=del_mes, key=f'pest_{mes_sel}')
         est = L.estado(lotes, 'pagos', fecha_cxp)
         h_tc = historial_tc()
-        avance, ps = [], []
+        avance, por_pestana = [], {}
         for t in del_mes:
             ps_t = proponer(leer_pestana(t, libro[t]), docs, h_tc, aplicado=est['aplicado'], registrados_app=est['registrados'],
                             en_lote=est['en_lote'], memoria=MEM)
+            por_pestana[t] = ps_t
             c = pd.Series([p.estado for p in ps_t]).value_counts() if ps_t else pd.Series(dtype=int)
             pend = int(c.get('listo', 0) + c.get('revisar', 0) + c.get('adelanto', 0))
+            estado_t = 'Sin movimientos' if not ps_t else ('Terminada' if pend == 0 and not c.get('en lote', 0) else 'En proceso')
             avance.append({'Pestaña': t.strip(), 'Egresos': len(ps_t), '✅ Registrados': int(c.get('registrado', 0)),
                            '📦 En lote': int(c.get('en lote', 0)), '🟢 Listos': int(c.get('listo', 0)),
                            '🟡 Revisar': int(c.get('revisar', 0)), '🔵 Adelantos': int(c.get('adelanto', 0)),
-                           '⚪ Fuera': int(c.get('fuera', 0)),
-                           'Estado': 'Sin movimientos' if not ps_t else ('Terminada' if pend == 0 and not c.get('en lote', 0) else 'En proceso')})
-            if t in elegidas:
-                ps += ps_t
-        st.dataframe(pd.DataFrame(avance), hide_index=True, width='stretch')
+                           '⚪ Fuera': int(c.get('fuera', 0)), 'Estado': estado_t})
+        etiqueta = {t: f"{a['Pestaña']} · {a['Estado']}" + (f" ({a['🟢 Listos']} listos, {a['🟡 Revisar']} por revisar)" if a['Estado'] == 'En proceso' else '')
+                    for t, a in zip(del_mes, avance)}
+        sugerida = next((t for t, a in zip(del_mes, avance) if a['Estado'] == 'En proceso'), del_mes[0])
+        pestana = c2.selectbox('Pestaña a trabajar (una a la vez)', del_mes, index=del_mes.index(sugerida),
+                               format_func=etiqueta.get, key=f'pest_{mes_sel}')
+        with st.expander('Avance de las pestañas del mes', expanded=False):
+            st.dataframe(pd.DataFrame(avance), hide_index=True, width='stretch')
+        ps = por_pestana[pestana]
+        st.caption('Solo egresos del banco (montos en negativo).')
         cont = pd.Series([p.estado for p in ps]).value_counts() if ps else pd.Series(dtype=int)
-        st.caption('Totales de los bancos elegidos:')
         cols = st.columns(6)
         for c, k in zip(cols, ['listo', 'revisar', 'adelanto', 'en lote', 'registrado', 'fuera']):
             c.metric(ESTADOS[k], int(cont.get(k, 0)))
 
-        st.subheader('Armar un lote')
+        st.subheader(f'Armar un lote · {pestana.strip()}')
+        st.caption('Por defecto entran todos los pagos listos de la pestaña. Para trabajar por bloques: filtre por días, cuenta o '
+                   'proveedor, o desmarque pagos.')
         listos = [p for p in ps if p.estado == 'listo']
         if not listos:
-            st.success('No hay pagos listos pendientes en las pestañas elegidas.')
+            st.success('No hay pagos listos pendientes en esta pestaña.')
         else:
             fechas = sorted({p.mov.fecha for p in listos})
             c1, c2, c3 = st.columns([2, 2, 3])
