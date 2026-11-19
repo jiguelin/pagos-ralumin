@@ -38,7 +38,7 @@ class Retencion:
 
 @dataclass
 class Interpretacion:
-    tipo: str               # 'pago' / 'adelanto' / 'fuera'
+    tipo: str               # 'pago' / 'adelanto' / 'fuera' / 'sin sustento'
     motivo: str = ''
     proveedor_texto: str = ''
     referencias: list[Referencia] = field(default_factory=list)
@@ -83,14 +83,21 @@ def interpretar(sustento: str, detalle: str = '') -> Interpretacion:
     u = s.upper()
     cc = next((v for k, v in cfg.CENTROS_COSTO.items() if k in u), '')
     if not s:
-        return Interpretacion('fuera', 'Sin sustento en la columna I')
+        # sin sustento: solo es "fuera" si el detalle del banco dice claramente que es un gasto bancario
+        d = ' '.join(str(detalle or '').upper().split())
+        for patron, motivo in cfg.FUERA_DE_ALCANCE:
+            if patron in d or d.startswith(('COMIS', 'IMPUESTO', 'ITF', 'MANT')):
+                return Interpretacion('fuera', motivo if patron in d else 'Gasto bancario', centro_costo=cc)
+        return Interpretacion('sin sustento', 'Falta el sustento en la columna I del Sheet', centro_costo=cc)
     # ---- fuera de alcance
     for patron, motivo in cfg.FUERA_DE_ALCANCE:
         if patron in u and not re.search(r'\bFAC\.|\bFACTURA\b|\bINVOICE\b|\bRH\b', u):
             return Interpretacion('fuera', motivo, centro_costo=cc)
     es_adelanto = u.startswith('ADELANTO') or ' ADELANTO ' in f' {u} '[:40]
     if not (es_adelanto or 'PAGO' in u or _RE_DOC.search(u)):
-        return Interpretacion('fuera', 'No parece un pago a proveedor', centro_costo=cc)
+        # no dice PAGO ni cita documentos ("4TO. ABONO SERNA DIAZ…"): no se descarta, queda para revisar
+        return Interpretacion('sin sustento', 'El sustento no dice qué se pagó (no menciona PAGO ni documentos)', centro_costo=cc,
+                              proveedor_texto=re.sub(r'^\S*\s*(ABONO|TRANSFERENCIA|DEPOSITO)\s+', '', u).strip())
     it = Interpretacion('adelanto' if es_adelanto else 'pago', centro_costo=cc, parcial='PARCIAL' in u)
     # ---- retenciones (informativas) y comisión: se sacan del texto antes de buscar facturas
     for m in _RE_RET.finditer(u):

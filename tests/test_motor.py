@@ -49,6 +49,12 @@ def test_fuera_de_alcance():
     assert interpretar('ABONO A LA CUENTA DE CAJA CHICA').tipo == 'fuera'
 
 
+def test_egresos_sin_sustento_no_se_esconden():
+    assert interpretar('', 'P.P.: 00110814009606181682-11').tipo == 'sin sustento'
+    assert interpretar('', 'COMISION DE MANTENIMIENTO').tipo == 'fuera'
+    assert interpretar('4TO. ABONO SERNA DIAZ MARIA VICTORIA').tipo == 'sin sustento'
+
+
 def test_clave_documento():
     assert clave_documento('00E001-0000000000029') == clave_documento('E001-29') == 'E001-29'
 

@@ -234,6 +234,11 @@ def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplica
             out.append(p)
             continue
         p.cuenta, p.moneda = cb
+        if it.tipo == 'sin sustento' and not (sol or pat):
+            p.estado = 'revisar'
+            p.motivos.append(it.motivo)
+            out.append(p)
+            continue
         if it.tipo == 'adelanto' and not sol:
             p.estado = 'adelanto'
             p.motivos.append('Adelanto de importación: se registra aparte')
