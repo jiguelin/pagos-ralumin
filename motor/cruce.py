@@ -33,6 +33,12 @@ def nombre_base(n: str) -> str:
     return ' '.join(s.split())
 
 
+_GENERICAS = {'PERU', 'SERVICIOS', 'SERVICIO', 'GRUPO', 'CORPORACION', 'INDUSTRIAL', 'INDUSTRIALES', 'COMERCIAL', 'INVERSIONES',
+              'EMPRESA', 'NEGOCIOS', 'CONSORCIO', 'PARTS', 'IMPORT', 'IMPORTADORA', 'TRADING', 'LOGISTICS', 'EXPRESS', 'INTERNATIONAL',
+              'ADUANAS', 'MINERA', 'MINERIA', 'TECNICA', 'GENERALES', 'PAGO', 'SOLUCIONES', 'INGENIERIA', 'TECNOLOGIA', 'MACHINERY',
+              'INDUSTRY', 'TECHNOLOGY', 'SUMINISTROS', 'DISTRIBUCIONES', 'CONTRATISTAS', 'REPRESENTACIONES', 'MAQUINARIAS', 'EQUIPOS'}
+
+
 def parecido(a: str, b: str) -> float:
     a, b = nombre_base(a), nombre_base(b)
     if not a or not b:
@@ -42,7 +48,9 @@ def parecido(a: str, b: str) -> float:
     ta, tb = set(a.split()), set(b.split())
     jac = len(ta & tb) / max(1, len(ta | tb))
     cont = 1.0 if (a in b or b in a) and min(len(a), len(b)) >= 4 else 0.0
-    return max(SequenceMatcher(None, a, b).ratio(), jac, 0.92 * cont)
+    # una palabra distintiva en común (GESTEMIND, SCHARFF…) acerca, pero no basta para cruzar sola (< 0.72)
+    distintiva = 0.7 if any(len(t) >= 5 and t not in _GENERICAS for t in ta & tb) else 0.0
+    return max(SequenceMatcher(None, a, b).ratio(), jac, 0.92 * cont, distintiva)
 
 
 def tipo_doc_identidad(ruc: str) -> str:
@@ -189,7 +197,7 @@ def _glosa(p: Propuesta) -> str:
 
 def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplicado: dict | None = None,
              registrados_app: set[str] | None = None, en_lote: set[str] | None = None,
-             bancos: dict | None = None) -> list[Propuesta]:
+             bancos: dict | None = None, memoria=None) -> list[Propuesta]:
     """Una propuesta por egreso, en orden de fecha. `aplicado` = montos ya usados por documento (lotes que la 4212
     cargada no refleja). `registrados_app` / `en_lote` = ids de movimientos que la app ya registró / puso en un lote."""
     idx = Indice4212(docs, aplicado)
@@ -212,7 +220,9 @@ def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplica
         it = interpretar(m.sustento, m.detalle)
         p.interp = it
         p.centro_costo = it.centro_costo
-        if it.tipo == 'fuera':
+        sol = memoria.solucion(m.id, firma) if memoria else None
+        pat = memoria.patron(m.sustento) if (memoria and not sol) else None
+        if it.tipo == 'fuera' and not (sol or pat):
             p.estado = 'fuera'
             p.motivos.append(it.motivo)
             out.append(p)
@@ -224,7 +234,7 @@ def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplica
             out.append(p)
             continue
         p.cuenta, p.moneda = cb
-        if it.tipo == 'adelanto':
+        if it.tipo == 'adelanto' and not sol:
             p.estado = 'adelanto'
             p.motivos.append('Adelanto de importación: se registra aparte')
             out.append(p)
@@ -238,24 +248,45 @@ def proponer(movs: list[Movimiento], docs: list[Documento], historial_tc, aplica
         p.tc, p.tc_fecha = t.venta, t.fecha
         if not exacto:
             p.notas.append(f'TC del {t.fecha:%d/%m} (sin publicación el {m.fecha:%d/%m})')
-        _cruzar(p, it, idx, bancos or cfg.RUC_BANCO)
+        bcos = bancos or cfg.RUC_BANCO
+        if sol:
+            _cruzar(p, _interp_de(it, sol['nombre'], sol['lineas'], sol.get('comision', 0.0), p.moneda), idx, bcos,
+                    memoria, ruc_forzado=sol['ruc'])
+            p.notas.insert(0, 'Solución guardada por el equipo' + (' (sugerida por IA)' if sol.get('origen') == 'ia' else ''))
+        else:
+            _cruzar(p, it if it.tipo == 'pago' else _interp_de(it, it.proveedor_texto, [], it.comision, p.moneda), idx, bcos, memoria)
+            if p.estado == 'revisar' and pat:
+                lineas = _lineas_por_patron(pat, p, it, idx)
+                if lineas:
+                    notas = list(p.notas)
+                    _reiniciar(p)
+                    p.notas = notas
+                    _cruzar(p, _interp_de(it, pat['nombre'], lineas, it.comision, p.moneda), idx, bcos, memoria,
+                            ruc_forzado=pat['ruc'])
+                    p.notas.insert(0, f'Patrón aprendido ({"saldo igual al pago" if pat["modo"] == "monto" else "documentos más antiguos"})')
         p.glosa = _glosa(p)
         out.append(p)
     return out
 
 
-def _cruzar(p: Propuesta, it: Interpretacion, idx: Indice4212, bancos: dict):
+def _cruzar(p: Propuesta, it: Interpretacion, idx: Indice4212, bancos: dict, memoria=None, ruc_forzado: str = ''):
     m = p.mov
     total = p.importe
     com = it.comision
     neto = round(total - com, 2)
-    # ---- proveedor y documentos
-    ruc_nombre, punt = idx.mejor_proveedor(it.proveedor_texto) if it.proveedor_texto else ('', 0.0)
-    ruc_guess = ruc_nombre if punt >= 0.72 else ''
+    # ---- proveedor y documentos: solución/patrón del equipo → alias aprendido → parecido de nombres
+    alias = memoria.ruc_alias(it.proveedor_texto) if (memoria and not ruc_forzado) else ''
+    if ruc_forzado or alias:
+        ruc_guess, punt = ruc_forzado or alias, 1.0
+        if alias:
+            p.notas.append('Proveedor reconocido por lo aprendido')
+    else:
+        ruc_nombre, punt = idx.mejor_proveedor(it.proveedor_texto) if it.proveedor_texto else ('', 0.0)
+        ruc_guess = ruc_nombre if punt >= 0.72 else ''
     encontrados: list[tuple] = []          # (ref, doc)
     faltan = []
     for r in it.referencias:
-        cands = idx.buscar(r.texto, ruc_guess, it.proveedor_texto, r.tipo_hint)
+        cands = idx.buscar(r.texto, ruc_guess, '' if ruc_forzado else it.proveedor_texto, r.tipo_hint)
         if len(cands) == 1:
             encontrados.append((r, cands[0]))
         elif len(cands) > 1:
@@ -356,6 +387,38 @@ def _cruzar(p: Propuesta, it: Interpretacion, idx: Indice4212, bancos: dict):
         q, rr = _q_r(com, p)
         p.lineas.append(Linea(tipo='13', numero=f'0000-{op}', fecha_doc=m.fecha, fecha_venc=m.fecha, ruc=ruc_b, nombre=nom_b,
                               monto=com, soles=q, dolares=rr, cuenta=cfg.CUENTA_COMISION, es_comision=True))
+
+
+def _interp_de(it: Interpretacion, nombre: str, lineas: list, comision: float, moneda_cuenta: str) -> Interpretacion:
+    """Interpretación armada con lo que decidió el equipo: [[n° documento, monto en la moneda de la cuenta], …]."""
+    from motor.sustento import Referencia
+    mon = 'USD' if moneda_cuenta == 'D' else 'PEN'
+    return Interpretacion('pago', proveedor_texto=nombre, comision=round(comision or 0.0, 2), retenciones=list(it.retenciones),
+                          centro_costo=it.centro_costo, referencias=[Referencia(str(n), '', round(float(x), 2), mon) for n, x in lineas])
+
+
+def _reiniciar(p: Propuesta):
+    p.estado = 'listo'
+    p.motivos, p.lineas, p.retenciones, p.notas = [], [], [], []
+
+
+def _lineas_por_patron(pat: dict, p: Propuesta, it: Interpretacion, idx: Indice4212) -> list:
+    """Documentos del proveedor del patrón: el de saldo igual al pago, o los más antiguos hasta cubrirlo."""
+    neto = round(p.importe - it.comision, 2)
+    docs = sorted([d for d in idx.por_ruc.get(pat['ruc'], []) if idx.disponible(d) > 0.05],
+                  key=lambda d: (d.fecha_doc or date.min, d.numero))
+    en_cuenta = lambda d: _de_moneda_doc(idx.disponible(d), p, d)
+    if pat['modo'] == 'monto':
+        iguales = [d for d in docs if abs(en_cuenta(d) - neto) <= cfg.TOL_SALDO]
+        return [[iguales[0].numero, neto]] if len(iguales) == 1 else []
+    out, resto = [], neto
+    for d in docs:
+        if resto <= 0.009:
+            break
+        x = round(min(en_cuenta(d), resto), 2)
+        out.append([d.numero, x])
+        resto = round(resto - x, 2)
+    return out if resto <= cfg.TOL_CUADRE else []
 
 
 def _q_r(monto: float, p: Propuesta) -> tuple[float, float]:

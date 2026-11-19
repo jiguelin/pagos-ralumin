@@ -41,6 +41,19 @@ Google Sheet (pestaña banco-mes) ─▶ egresos sin asiento en la columna de co
 | Columna de control | La que sigue a CARGO / ABONO en cada pestaña: si tiene cualquier valor, el movimiento ya está registrado. |
 | Cuentas bancarias | 104102 BCP ME · 104103 BCP MN · 104101 caja chica · 104104 Scotiabank ME · 104105 BBVA MN (editable en ⚙️). |
 
+## Lo que la app aprende (v0.2.0)
+
+Tres niveles, en este orden:
+
+1. **Reglas fijas** (arriba).
+2. **Memoria del equipo** (se guarda en la base, a la vista en ⚙️ Configuración → Lo aprendido):
+   en **💸 Pagos → Resolver pagos dudosos** se elige proveedor y documentos de un pago 🟡; la app lo aplica y recuerda
+   el **proveedor para ese texto** (alias) y, si se marca, un **patrón mensual** para pagos con el mismo texto
+   (sin importar números ni meses): elegir el documento con saldo igual al pago, o los más antiguos.
+3. **IA solo en casos dudosos** (si hay `ANTHROPIC_API_KEY`): botón **✨ Sugerir con IA**. Elige solo entre proveedores
+   y documentos pendientes reales; lo inventado se descarta y se avisa si no cuadra con el banco. Nunca entra sola a un
+   lote: el equipo acepta o corrige, y lo aceptado pasa a la memoria (la próxima vez no se consulta a la IA).
+
 Reglas en `ralumin/config.py`. Lo que el app todavía no sabe cruzar (planilla, AFP, impuestos, adelantos…) queda a la
 vista en **Por revisar / Fuera de alcance** con su motivo, para ir agregando reglas por bloques.
 

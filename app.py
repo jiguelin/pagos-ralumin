@@ -24,7 +24,9 @@ from motor import lotes as L
 from motor.almacen import Almacen, ErrorAlmacen
 from motor.asiento_retenciones import asientos_de_retenciones, proponer_retenciones
 from motor.banco import descargar_sheet, info_pestana, leer_libro, leer_pestana, pestanas_con_bancos
-from motor.cruce import proponer
+from motor import ia as IA
+from motor.cruce import Indice4212, _de_moneda_doc, parecido, proponer
+from motor.memoria import Memoria
 from motor.cxp import Documento, leer_entidades, leer_pendientes
 from motor.exportar import asientos_de_pagos, excel_importacion, excel_revision, ordenar
 from motor.retenciones import leer_excel_retenciones
@@ -77,6 +79,9 @@ except ErrorAlmacen as ex:
     st.stop()
 
 SHEET_ID = secreto('SHEET_ID', cfg.SHEET_ID)
+API_IA = secreto('ANTHROPIC_API_KEY')
+MODELO_IA = secreto('IA_MODELO', IA.MODELO_DEFECTO)
+MEM = Memoria(ALM)
 ESTADOS = {'listo': '🟢 Listo', 'revisar': '🟡 Revisar', 'adelanto': '🔵 Adelanto', 'fuera': '⚪ Fuera de alcance',
            'en lote': '📦 En lote', 'registrado': '✅ Registrado', 'sin saldo': '⚪ Sin saldo', 'anulado': '⚪ Anulado'}
 
@@ -255,6 +260,80 @@ def descargar_lote(lote: dict, asientos):
     ALM.guardar(f'lote_archivos:{lote["num"]:05d}', dict(importar=base64.b64encode(imp).decode(), revision=base64.b64encode(rev).decode()))
 
 
+def resolver_dudosos(ps, docs, est):
+    """El equipo (o la IA, si hay clave) elige proveedor y documentos; la app lo guarda y lo aprende."""
+    pool = [p for p in ps if p.estado == 'revisar']
+    if st.toggle('Incluir "fuera de alcance" y adelantos (para enseñarle pagos nuevos: AFP, alquileres…)', key='res_fuera'):
+        pool += [p for p in ps if p.estado in ('fuera', 'adelanto')]
+    if not pool:
+        return
+    st.subheader(f'🟡 Resolver pagos dudosos ({len(pool)})')
+    st.caption('Elija proveedor y documentos. La app lo aplica a este pago y, si lo marca, lo recuerda para los próximos meses.')
+    opciones = {p.mov.id: f"{p.mov.fecha:%d/%m} · {p.mov.pestana.strip()} · {p.importe:,.2f} · {p.mov.sustento[:80]}" for p in pool}
+    pid = st.selectbox('Pago', list(opciones), format_func=opciones.get, key='res_pago')
+    p = next(x for x in pool if x.mov.id == pid)
+    st.markdown(f'**Sustento:** {p.mov.sustento or "(vacío)"}  \n**Banco:** {p.mov.detalle} · operación {p.mov.operacion}')
+    if p.motivos:
+        st.caption('Motivo: ' + '; '.join(p.motivos))
+    if not p.cuenta or not p.tc:
+        st.warning('Primero falta la cuenta bancaria configurada o el tipo de cambio de ese día.')
+        return
+    idx = Indice4212(docs, est['aplicado'])
+    clave_sug = f'sug_{pid}'
+    if API_IA:
+        if st.button('✨ Sugerir con IA', key=f'ia_{pid}'):
+            with st.spinner('Consultando…'):
+                try:
+                    st.session_state[clave_sug] = IA.sugerir(p, idx, API_IA, MODELO_IA)
+                except Exception as ex:
+                    st.error(f'No se pudo consultar a la IA: {ex}')
+    sug = st.session_state.get(clave_sug)
+    if sug:
+        (st.info if sug.ruc else st.warning)(f"IA ({sug.confianza}%): {sug.razon}" + ('  \n' + '  \n'.join(sug.avisos) if sug.avisos else ''))
+    texto = (p.interp.proveedor_texto if p.interp else '') or p.mov.sustento
+    ranking = [r for r, _ in sorted(idx.nombres.items(), key=lambda kv: -parecido(texto, kv[1]))]
+    preferido = (sug.ruc if sug and sug.ruc else '') or (p.ruc if p.ruc in idx.nombres else '') or (ranking[0] if ranking else '')
+    if not ranking:
+        st.warning('No hay documentos pendientes cargados.')
+        return
+    ruc = st.selectbox('Proveedor', ranking, index=ranking.index(preferido) if preferido in ranking else 0,
+                       format_func=lambda r: f'{idx.nombres[r]} ({r})', key=f'prov_{pid}')
+    sug_l = {n: m for n, m in (sug.lineas if sug and sug.ruc == ruc else [])}
+    ds = sorted([d for d in idx.por_ruc.get(ruc, []) if idx.disponible(d) > 0.05], key=lambda d: (d.fecha_doc is None, d.fecha_doc))
+    neto = round(p.importe - (p.interp.comision if p.interp else 0), 2)
+    filas = []
+    for d in ds:
+        en_cta = _de_moneda_doc(idx.disponible(d), p, d)
+        incluir = d.numero in sug_l or (not sug_l and abs(en_cta - neto) <= 0.05)
+        filas.append({'Incluir': incluir, 'Documento': d.numero, 'Cuenta': d.cuenta, 'Fecha': d.fecha_doc,
+                      'Mon.': d.moneda, 'Saldo': idx.disponible(d), f'Pagar ({p.moneda})': sug_l.get(d.numero, en_cta if incluir else 0.0)})
+    if not filas:
+        st.warning('Ese proveedor no tiene documentos pendientes.')
+        return
+    ed = st.data_editor(pd.DataFrame(filas), hide_index=True, width='stretch', key=f'docs_{pid}_{ruc}',
+                        disabled=['Documento', 'Cuenta', 'Fecha', 'Mon.', 'Saldo'],
+                        column_config={'Fecha': st.column_config.DateColumn(format='DD/MM/YYYY')})
+    col_pago = f'Pagar ({p.moneda})'
+    c1, c2 = st.columns(2)
+    com = c1.number_input('Comisión del banco', min_value=0.0, step=0.01, format='%.2f', key=f'com_{pid}',
+                          value=float(sug.comision if sug and sug.ruc else (p.interp.comision if p.interp else 0.0)))
+    elegidas = [[r['Documento'], round(float(r[col_pago] or 0), 2)] for r in ed.to_dict('records') if r['Incluir'] and r[col_pago]]
+    dif = round(p.importe - sum(x for _, x in elegidas) - com, 2)
+    c2.metric('Diferencia con el banco', f'{dif:,.2f}')
+    recordar = st.checkbox('Recordar este proveedor para este texto del sustento', value=True, key=f'rec_{pid}')
+    modo = st.radio('En los próximos meses, para pagos con el mismo texto (sin importar números ni meses):',
+                    ['No', 'Elegir el documento con saldo igual al pago', 'Elegir los documentos más antiguos'],
+                    horizontal=True, key=f'modo_{pid}')
+    if st.button('Guardar solución', type='primary', disabled=(abs(dif) > 0.01 or not elegidas), key=f'guardar_{pid}'):
+        MEM.aprender(mov_id=p.mov.id, firma=L.firma_mov(p.mov), sustento=p.mov.sustento,
+                     proveedor_texto=texto if p.interp and p.interp.proveedor_texto else '', ruc=ruc, nombre=idx.nombres[ruc],
+                     lineas=elegidas, comision=com, origen='ia' if sug and sug.ruc == ruc else 'equipo',
+                     recordar_alias=recordar, modo_patron={'No': '', 'Elegir el documento con saldo igual al pago': 'monto'}.get(modo, 'antiguo'))
+        st.session_state.pop(clave_sug, None)
+        st.success('Guardado: el pago pasa a 🟢 Listo.')
+        st.rerun()
+
+
 # ----------------------------------------------------------------------------- pantalla principal
 st.title('Pagos Ralumin')
 st.markdown('<span class="pequeno">Banco (Google Sheet) × cuentas por pagar → plantilla de "Importación de Pagos" de NewContaSis, por lotes.</span>',
@@ -280,7 +359,7 @@ with t_pagos:
         movs = [m for t in elegidas for m in leer_pestana(t, libro[t])]
         est = L.estado(lotes, 'pagos', fecha_cxp)
         ps = proponer(movs, docs, historial_tc(), aplicado=est['aplicado'], registrados_app=est['registrados'],
-                      en_lote=est['en_lote'])
+                      en_lote=est['en_lote'], memoria=MEM)
         cont = pd.Series([p.estado for p in ps]).value_counts() if ps else pd.Series(dtype=int)
         cols = st.columns(6)
         for c, k in zip(cols, ['listo', 'revisar', 'adelanto', 'en lote', 'registrado', 'fuera']):
@@ -328,11 +407,12 @@ with t_pagos:
                     st.success(f'Lote {lote["num"]} creado. Descárguelo en la pestaña Lotes.')
                     st.rerun()
 
+        resolver_dudosos(ps, docs, est)
         for k, titulo in (('revisar', '🟡 Por revisar'), ('adelanto', '🔵 Adelantos de importación'),
                           ('en lote', '📦 En lotes sin confirmar'), ('fuera', '⚪ Fuera de alcance'), ('registrado', '✅ Ya registrados')):
             grupo = [p for p in ps if p.estado == k]
             if grupo:
-                with st.expander(f'{titulo} ({len(grupo)})', expanded=(k == 'revisar')):
+                with st.expander(f'{titulo} ({len(grupo)})', expanded=False):
                     st.dataframe(tabla_propuestas(grupo).drop(columns=['Estado', '_id']), hide_index=True, width='stretch',
                                  column_config={'Fecha': st.column_config.DateColumn(format='DD/MM/YYYY')})
 
@@ -460,6 +540,23 @@ with t_conf:
                                              for r in ed.to_dict('records') if r.get('cuenta')])
         st.success('Guardado.')
         st.rerun()
+    st.subheader('Lo aprendido')
+    st.caption(f"{len(MEM.alias)} proveedores reconocidos · {len(MEM.patrones)} patrones mensuales · "
+               f"{len({id(v) for v in MEM.soluciones.values()})} pagos resueltos a mano. IA: {'activa (' + MODELO_IA + ')' if API_IA else 'sin clave'}.")
+    if MEM.alias:
+        st.dataframe(pd.DataFrame([{'Texto del Sheet': v.get('texto', k), 'Proveedor': v['nombre'], 'RUC': v['ruc'], 'Origen': v['origen'],
+                                    'Fecha': v['creado'][:10]} for k, v in MEM.alias.items()]), hide_index=True, width='stretch')
+        borrar = st.multiselect('Olvidar proveedores', list(MEM.alias), format_func=lambda k: MEM.alias[k].get('texto', k), key='olv_alias')
+        if borrar and st.button('Olvidar seleccionados', key='btn_olv_alias'):
+            MEM.olvidar('alias', borrar)
+            st.rerun()
+    if MEM.patrones:
+        st.dataframe(pd.DataFrame([{'Patrón': k, 'Proveedor': v['nombre'], 'Regla': 'saldo igual al pago' if v['modo'] == 'monto' else 'más antiguos',
+                                    'Ejemplo': v['ejemplo'], 'Fecha': v['creado'][:10]} for k, v in MEM.patrones.items()]), hide_index=True, width='stretch')
+        borrar = st.multiselect('Olvidar patrones', list(MEM.patrones), key='olv_pat')
+        if borrar and st.button('Olvidar seleccionados', key='btn_olv_pat'):
+            MEM.olvidar('patrones', borrar)
+            st.rerun()
     st.subheader('Reglas fijas')
     st.markdown(f"""
 - Comisión bancaria: **{cfg.CUENTA_COMISION}**, línea dentro del mismo pago (una sola 104 por cargo del banco).
